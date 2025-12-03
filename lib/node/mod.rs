@@ -136,19 +136,27 @@ where
         let env_path = datadir.join("data.mdb");
         // let _ = std::fs::remove_dir_all(&env_path);
         std::fs::create_dir_all(&env_path)?;
-        let env = {
-            let mut env_open_opts = heed::EnvOpenOptions::new();
-            env_open_opts
-                .map_size(128 * 1024 * 1024 * 1024) // 128 GB
-                .max_dbs(
-                    State::NUM_DBS
-                        + Archive::NUM_DBS
-                        + MemPool::NUM_DBS
-                        + Net::NUM_DBS,
+let env = {
+    let mut env_open_opts = heed::EnvOpenOptions::new();
+    unsafe {
+        env_open_opts
+            .map_size(128 * 1024 * 1024 * 1024) // 128 GB
+            .max_dbs(
+                State::NUM_DBS
+                    + Archive::NUM_DBS
+                    + MemPool::NUM_DBS
+                    + Net::NUM_DBS,
+            )
+            // PERFORMANCE FLAGS - These will fix your slow IBD and startup times
+            .flags(
+                heed::EnvFlags::WRITE_MAP |     // Use memory-mapped writes
+                heed::EnvFlags::MAP_ASYNC |     // Async memory sync  
+                heed::EnvFlags::NO_TLS  
                 );
-            unsafe { Env::open(&env_open_opts, &env_path) }
-                .map_err(EnvError::from)?
-        };
+    }
+    unsafe { Env::open(&env_open_opts, &env_path) }
+        .map_err(EnvError::from)?
+};
         let state = State::new(&env)?;
         let archive = Archive::new(&env)?;
         let mempool = MemPool::new(&env)?;
