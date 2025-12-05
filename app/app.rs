@@ -18,10 +18,13 @@ use thunder_orchard::{
 };
 use tokio::{spawn, sync::RwLock as TokioRwLock, task::JoinHandle};
 use tokio_util::task::LocalPoolHandle;
+use tokio::sync::Semaphore;
 use tonic_health::{
     ServingStatus,
     pb::{HealthCheckRequest, health_client::HealthClient},
 };
+
+
 
 use crate::cli::Config;
 
@@ -158,31 +161,62 @@ pub struct App {
     pub transaction: Arc<RwLock<Transaction>>,
     pub runtime: Arc<tokio::runtime::Runtime>,
     pub local_pool: LocalPoolHandle,
+    pub db_semaphore: Arc<Semaphore>,
 }
 
 impl App {
-    async fn task(
-        node: Arc<Node>,
-        utxos: Arc<RwLock<HashMap<OutPoint, Output>>>,
-        wallet: Wallet,
-    ) -> Result<(), Error> {
-        let mut state_changes = node.watch_state();
-        while let Some(()) = state_changes.next().await {
-            let () = update(&node, &mut utxos.write(), &wallet)?;
+async fn task(
+    node: Arc<Node>,
+    utxos: Arc<RwLock<HashMap<OutPoint, Output>>>,
+    wallet: Wallet,
+    db_semaphore: Arc<Semaphore>,
+) -> Result<(), Error> {
+    let mut state_changes = node.watch_state();
+    while let Some(()) = state_changes.next().await {
+        let _permit = db_semaphore.acquire().await.unwrap();
+        
+        // Add timeout to prevent holding semaphore forever
+        let update_result = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            tokio::task::spawn_blocking({
+                let node = node.clone();
+                let utxos = utxos.clone();
+                let wallet = wallet.clone();
+                move || update(&node, &mut utxos.write(), &wallet)
+            })
+        ).await;
+        
+        match update_result {
+            Ok(Ok(Ok(()))) => {
+                // Silent success
+            }
+            Ok(Ok(Err(update_err))) => {
+                tracing::error!("Background wallet update failed: {update_err}");
+            }
+            Ok(Err(join_err)) => {
+                tracing::error!("Background update task panicked: {join_err}");
+            }
+            Err(_timeout) => {
+                tracing::error!("Background update timed out after 30 seconds");
+            }
         }
-        Ok(())
+        
+        tokio::task::yield_now().await;
     }
+    Ok(())
+}
 
-    fn spawn_task(
-        node: Arc<Node>,
-        utxos: Arc<RwLock<HashMap<OutPoint, Output>>>,
-        wallet: Wallet,
-    ) -> JoinHandle<()> {
-        spawn(Self::task(node, utxos, wallet).unwrap_or_else(|err| {
-            let err = anyhow::Error::from(err);
-            tracing::error!("{err:#}")
-        }))
-    }
+fn spawn_task(
+    node: Arc<Node>,
+    utxos: Arc<RwLock<HashMap<OutPoint, Output>>>,
+    wallet: Wallet,
+    db_semaphore: Arc<Semaphore>,
+) -> JoinHandle<()> {
+    spawn(Self::task(node, utxos, wallet, db_semaphore).unwrap_or_else(|err| {
+        let err = anyhow::Error::from(err);
+        tracing::error!("{err:#}")
+    }))
+}
 
     async fn check_status_serving(
         client: &mut HealthClient<tonic::transport::Channel>,
@@ -322,8 +356,8 @@ impl App {
         };
         let node = Arc::new(node);
         let miner = miner.map(|miner| Arc::new(TokioRwLock::new(miner)));
-        let task =
-            Self::spawn_task(node.clone(), utxos.clone(), wallet.clone());
+let db_semaphore = Arc::new(Semaphore::new(1)); // Only one database operation at a time
+let task = Self::spawn_task(node.clone(), utxos.clone(), wallet.clone(), db_semaphore.clone());
         drop(rt_guard);
         Ok(Self {
             node,
@@ -339,6 +373,7 @@ impl App {
             })),
             runtime: Arc::new(runtime),
             local_pool,
+            db_semaphore,
         })
     }
 
@@ -612,6 +647,77 @@ impl App {
             drop(miner_write);
             Ok(txid)
         })
+    }
+    
+pub async fn get_new_transparent_address_coordinated(&self) -> Result<TransparentAddress, Error> {
+    tracing::info!("🔒 Acquiring semaphore for address generation...");
+    let permit_start = std::time::Instant::now();
+    let _permit = self.db_semaphore.acquire().await.unwrap();
+    tracing::info!("✅ Semaphore acquired in {:?}", permit_start.elapsed());
+    
+    let wallet = self.wallet.clone();
+    
+    tracing::info!("🚀 Starting spawn_blocking task...");
+    let blocking_start = std::time::Instant::now();
+    
+    let result = tokio::task::spawn_blocking(move || -> Result<TransparentAddress, thunder_orchard::wallet::Error> {
+        use std::time::Instant;
+        
+        tracing::info!("📝 Creating write transaction...");
+        let tx_start = Instant::now();
+        let mut rwtxn = wallet.env().write_txn()?;
+        tracing::info!("✅ Write transaction created in {:?}", tx_start.elapsed());
+        
+        tracing::info!("🔑 Calling get_new_transparent_address...");
+        let addr_start = Instant::now();
+        let res = wallet.get_new_transparent_address(&mut rwtxn)?;
+        tracing::info!("✅ Address generated in {:?}, address: {}", addr_start.elapsed(), res);
+        
+        tracing::info!("💾 Committing transaction...");
+        let commit_start = Instant::now();
+        rwtxn.commit()?;
+        tracing::info!("✅ Transaction committed in {:?}", commit_start.elapsed());
+        
+        Ok(res)
+    })
+    .await;
+    
+    tracing::info!("🏁 Blocking task completed in {:?}", blocking_start.elapsed());
+    
+    result
+        .map_err(|e| Error::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?
+        .map_err(Error::from)
+}
+
+
+    // Also add the shielded version
+
+    pub async fn get_new_shielded_address_coordinated(&self) -> Result<types::ShieldedAddress, Error> {
+
+        let _permit = self.db_semaphore.acquire().await.unwrap();
+
+        
+
+        let wallet = self.wallet.clone();
+
+        tokio::task::spawn_blocking(move || -> Result<types::ShieldedAddress, thunder_orchard::wallet::Error> {
+
+            let mut rwtxn = wallet.env().write_txn()?;
+
+            let res = wallet.get_new_orchard_address(&mut rwtxn)?;
+
+            rwtxn.commit()?;
+
+            Ok(res)
+
+        })
+
+        .await
+
+        .map_err(|e| Error::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?
+
+        .map_err(Error::from)
+
     }
 }
 

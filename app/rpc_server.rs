@@ -147,28 +147,53 @@ impl RpcServer for RpcServerImpl {
             .map_err(custom_err)
     }
 
-    async fn get_new_shielded_address(&self) -> RpcResult<ShieldedAddress> {
-        (|| {
-            let mut rwtxn = self.app.wallet.env().write_txn()?;
-            let res = self.app.wallet.get_new_orchard_address(&mut rwtxn)?;
-            rwtxn.commit()?;
-            Ok::<_, thunder_orchard::wallet::Error>(res)
-        })()
-        .map_err(custom_err)
+async fn get_new_transparent_address(&self) -> RpcResult<TransparentAddress> {
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(10), // Reasonable timeout
+        self.app.get_new_transparent_address_coordinated() // Uses semaphore coordination
+    ).await {
+        Ok(Ok(address)) => {
+            tracing::debug!("Successfully generated transparent address: {address}");
+            Ok(address)
+        },
+        Ok(Err(app_err)) => {
+            tracing::error!("App error: {app_err}");
+            Err(custom_err(app_err))
+        },
+        Err(_timeout) => {
+            tracing::error!("Address generation timed out");
+            Err(jsonrpsee::types::ErrorObjectOwned::owned(
+                -32000,
+                "Address generation timeout",
+                Some("Operation timed out".to_string())
+            ))
+        }
     }
+}
 
-    async fn get_new_transparent_address(
-        &self,
-    ) -> RpcResult<TransparentAddress> {
-        (|| {
-            let mut rwtxn = self.app.wallet.env().write_txn()?;
-            let res =
-                self.app.wallet.get_new_transparent_address(&mut rwtxn)?;
-            rwtxn.commit()?;
-            Ok::<_, thunder_orchard::wallet::Error>(res)
-        })()
-        .map_err(custom_err)
+async fn get_new_shielded_address(&self) -> RpcResult<ShieldedAddress> {
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        self.app.get_new_shielded_address_coordinated()
+    ).await {
+        Ok(Ok(address)) => {
+            tracing::debug!("Successfully generated shielded address: {address}");
+            Ok(address)
+        },
+        Ok(Err(app_err)) => {
+            tracing::error!("App error: {app_err}");
+            Err(custom_err(app_err))
+        },
+        Err(_timeout) => {
+            tracing::error!("Shielded address generation timed out");
+            Err(jsonrpsee::types::ErrorObjectOwned::owned(
+                -32000,
+                "Address generation timeout",
+                Some("Operation timed out".to_string())
+            ))
+        }
     }
+}
 
     async fn get_shielded_wallet_addresses(
         &self,
